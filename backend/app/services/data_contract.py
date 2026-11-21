@@ -5,6 +5,7 @@ import time
 import uuid
 from typing import Any
 
+from app.services import cache_retire_batch as retire_batch
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -96,6 +97,99 @@ class DataContractService(BaseModuleService):
             "consumption_records": len(consumption_records),
         }
 
+    def verify_with_retire_evidence(self, contract_id: int) -> dict[str, Any]:
+        """凭缓存退役证据批次校验受影响来源的覆盖，把违约/恢复回写到检查清单。
+
+        跨模块数据流：
+        - 读取 source_registry 定位契约覆盖的来源
+        - 读取 cache_retire_batch 证据批次，核对退役/恢复是否覆盖全部受影响条目
+        - 读取 result_cache 检查是否存在批次之外的静默过期、或退役完成仍有效的条目
+        - 回写 data_contract.检查清单 与批次.契约回写，消费过的批次仍可核对
+        """
+        contract = store.find(self.MODULE, contract_id)
+        if contract is None:
+            return {"ok": False, "message": "数据契约不存在"}
+
+        dataset = str(contract.get("数据集", ""))
+        sources = [
+            s for s in store.rows("source_registry")
+            if str(s.get("源编号", ""))
+            and (str(s.get("源编号")) in dataset or dataset in str(s.get("连接地址", "")))
+        ]
+
+        checklist: list[dict[str, Any]] = []
+        coverage_violations: list[str] = []
+        consumed_batches: list[int] = []
+        affected = False
+        retired_ids = retire_batch.retired_cache_ids()
+
+        for s in sources:
+            sid = int(s.get("id", 0))
+            finalized = [b for b in retire_batch.batches_for_source(sid)
+                         if b.get("status") in retire_batch.FINAL_STATUSES]
+            if not finalized:
+                continue
+            affected = True
+
+            latest_retire = _latest(finalized, retire_batch.RETIRE_ACTION)
+            latest_recovery = _latest(finalized, retire_batch.RECOVER_ACTION)
+            confirmed_ids = {
+                int(i["cache_id"])
+                for b in finalized for i in b.get("evidence", {}).get("confirmed", [])
+            }
+
+            # 覆盖校验一：引用该来源且已过期/已淘汰的条目必须被证据批次覆盖
+            for e in store.rows("result_cache"):
+                if (e.get("status") in ("已过期", "已淘汰")
+                        and retire_batch.entry_references_source(e, sid)
+                        and int(e.get("id", 0)) not in confirmed_ids):
+                    coverage_violations.append(
+                        f"缓存条目{e.get('条目编号')}已{e.get('status')}但无退役证据批次覆盖")
+
+            # 覆盖校验二：退役完成的条目不得仍然有效（有效读取与退役完成互斥）
+            for cid in confirmed_ids & retired_ids:
+                entry = store.find("result_cache", cid)
+                if entry is not None and entry.get("status") == "有效":
+                    coverage_violations.append(
+                        f"缓存条目{entry.get('条目编号')}退役已完成却仍有效")
+
+            if latest_retire is not None and (
+                    latest_recovery is None or int(latest_recovery["id"]) < int(latest_retire["id"])):
+                verdict, batch = "已违约", latest_retire
+            else:
+                verdict, batch = "已恢复", latest_recovery
+            checklist.append({
+                "来源编号": s.get("源编号"),
+                "批次编号": batch.get("批次编号"),
+                "结果": verdict,
+                "核对时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            retire_batch.write_contract_verdict(int(batch["id"]), contract, verdict)
+            consumed_batches.append(int(batch["id"]))
+
+        if not affected:
+            return {"ok": False, "message": "契约覆盖的来源没有退役证据批次", "contract_id": contract_id}
+
+        contract["检查清单"] = checklist
+        if coverage_violations or any(item["结果"] == "已违约" for item in checklist):
+            contract["status"] = "已违约"
+            contract["pending"] = True
+            contract["abnormal"] = True
+        else:
+            contract["status"] = "已承诺"
+            contract["pending"] = False
+            contract["abnormal"] = False
+
+        _write_contract_audit(contract_id, f"retire_evidence:{len(checklist)}来源")
+        return {
+            "ok": True,
+            "contract_id": contract_id,
+            "status": contract["status"],
+            "checklist": checklist,
+            "coverage_violations": coverage_violations,
+            "consumed_batches": consumed_batches,
+        }
+
     def propagate_schema_change(self, contract_id: int, new_schema: str) -> dict[str, Any]:
         """当Schema变化时，通过契约将变更通知所有消费者。
 
@@ -145,3 +239,29 @@ class DataContractService(BaseModuleService):
             "old_schema": old_schema,
             "new_schema": new_schema,
         }
+
+
+def _latest(batches: list[dict[str, Any]], action: str) -> dict[str, Any] | None:
+    found = None
+    for b in batches:
+        if b.get("触发动作") == action and (found is None or int(b["id"]) > int(found["id"])):
+            found = b
+    return found
+
+
+def _write_contract_audit(contract_id: int, action: str) -> None:
+    rows = store.rows("query_audit")
+    rows.append({
+        "id": max((int(r.get("id", 0)) for r in rows), default=0) + 1,
+        "记录编号": f"AUDIT-{uuid.uuid4().hex[:8]}",
+        "查询语句": f"data_contract.{action}(contract_id={contract_id})",
+        "执行耗时": "80ms",
+        "扫描行数": "1",
+        "返回行数": "1",
+        "数据来源": "data_contract",
+        "操作用户": "contract_manager",
+        "查询时间": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "status": "正常",
+        "pending": False,
+        "abnormal": False,
+    })

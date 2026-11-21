@@ -27,5 +27,6 @@ SEED_ROWS: dict[str, list[dict[str, Any]]] = {
     "data_lake_read": [_seed(1, {"路径编号":"DATA-0001","存储位置":"s3://data-lake/prod","文件格式":"parquet","分区模式":"dt","Schema推导":"","文件列表":"","最后扫描":"","数据量":""})],
     "result_cache": [_seed(1, {"条目编号":"RESU-0001","查询摘要":"sample query","结果哈希":"abc123","缓存命中":"5","过期时间":"2027-01-01","存储大小":"100","创建时间":"2026-11-01","最后命中":"2026-11-01"})],
     "data_contract": [_seed(1, {"契约编号":"DATA-0001","数据集":"analytics","Schema约束":"id,name,value","SLA定义":"每小时更新","更新频率":"3600","负责人":"admin","消费者":"dashboard","生效时间":"2026-11-01"})],
+    "cache_retire_batch": [_seed(1, {"批次编号":"RETI-0001","来源编号":"SOUR-0000","触发动作":"来源下线","涉及条目数":"0","已确认条目":"-","待完成条目":"-","契约回写":"-","归档时间":"2026-11-01","status":"已归档","pending":False,"source_id":0,"round_id":"seed","evidence":{"confirmed":[],"pending":[]},"contract_checklist":[],"consumed_by":[],"conflict":""})],
     "ab_config": [_seed(1, {"实验编号":"AB_C-0001","实验名称":"实验配置样例","分流比例":"50:50","指标集合":"revenue","对照组":"baseline","实验组":"variant","置信水平":"0.95","运行期间":"2026-11"})],
 }

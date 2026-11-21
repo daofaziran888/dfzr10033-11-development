@@ -6,6 +6,7 @@ import time
 import uuid
 from typing import Any
 
+from app.services import cache_retire_batch as retire_batch
 from app.services.base import BaseModuleService
 from app.store import store
 
@@ -69,6 +70,34 @@ class ResultCacheService(BaseModuleService):
             "entries": invalidated[:10],
         }
 
+    def retire_source(self, source_id: int, finalize: bool = True) -> dict[str, Any]:
+        """来源退役：生成缓存退役证据批次，只归档实际引用该来源的有效条目。
+
+        finalize=False 时批次停留在「汇总中」，模拟单边变更中断，
+        待完成条目留在证据组里，可经 finalize_retire_batch 补完。
+        """
+        return retire_batch.create_retire_batch(source_id, finalize=finalize)
+
+    def finalize_retire_batch(self, batch_id: int) -> dict[str, Any]:
+        """归档退役批次：待完成条目逐条过期并转入已确认组。"""
+        return retire_batch.finalize_retire_batch(batch_id)
+
+    def recover_source(self, source_id: int) -> dict[str, Any]:
+        """来源恢复确认：同一轮未归档清理与之冲突；否则按最近退役批次恢复。"""
+        return retire_batch.recover_source(source_id)
+
+    def verify_batch(self, batch_id: int) -> dict[str, Any]:
+        """核对证据批次：已确认条目与实际状态对账；已消费批次仍可核对。"""
+        return retire_batch.verify_batch(batch_id)
+
+    def verify_retirement_invariant(self) -> dict[str, Any]:
+        """互斥不变量：退役完成的条目不得对外有效读取。"""
+        return retire_batch.verify_retirement_invariant()
+
+    def unfinished_retire_entries(self) -> list[dict[str, Any]]:
+        """单边变更中断后仍未完成归档的缓存条目。"""
+        return retire_batch.unfinished_entries()
+
     def get_cached_result(self, query_fingerprint: str) -> dict[str, Any] | None:
         """按查询摘要查找缓存结果，更新命中计数。被 query_federation、data_exporter 调用。"""
         entries = store.rows(self.MODULE)
@@ -84,6 +113,12 @@ class ResultCacheService(BaseModuleService):
                         continue
                 except (ValueError, OverflowError):
                     pass
+
+                # 互斥不变量：退役批次已归档的条目不得再对外提供有效读取
+                if int(entry.get("id", 0)) in retire_batch.retired_cache_ids():
+                    entry["status"] = "已过期"
+                    entry["pending"] = False
+                    continue
 
                 # 更新命中统计
                 entry["缓存命中"] = str(int(entry.get("缓存命中", "0")) + 1)

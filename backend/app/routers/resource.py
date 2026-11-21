@@ -221,3 +221,74 @@ def pipeline_cost_aggregate_alert() -> dict[str, Any]:
             "cost_aggregation": cost_svc.aggregate_module_costs(),
             "quota_check": cost_svc.check_monthly_quota(),
             "cache_report": result_cache_svc.cache_hit_rate_report()}
+
+
+@router.post("/pipelines/retire-recover-evidence")
+def pipeline_retire_recover_evidence(
+    source_no: str = Query(...), source_type: str = Query(default="mysql"),
+    source_addr: str = Query(default="db://demo/retire"),
+) -> dict[str, Any]:
+    """来源下线→恢复的证据批次全流程：冲突检测、归档、契约回写、不变量核对。"""
+    entry, msg = source_svc.register_source({
+        "源编号": source_no, "源类型": source_type, "连接地址": source_addr,
+        "驱动配置": f"{source_type}_driver", "数据库名": "demo_db", "认证方式": "token"})
+    if entry is None:
+        raise HTTPException(status_code=400, detail=msg)
+    sid = entry["id"]
+    control, msg = source_svc.register_source({
+        "源编号": f"{source_no}-CTRL", "源类型": source_type, "连接地址": f"{source_addr}_ctrl",
+        "驱动配置": f"{source_type}_driver", "数据库名": "demo_db", "认证方式": "token"})
+    if control is None:
+        raise HTTPException(status_code=400, detail=msg)
+
+    def _cache(no_suffix: str, summary: str) -> dict[str, Any]:
+        ce, missing = result_cache_svc.create_entry({
+            "条目编号": f"RESU-R{sid:04d}{no_suffix}", "查询摘要": summary, "结果哈希": "h" + no_suffix,
+            "缓存命中": "0", "过期时间": "2027-12-31 00:00:00", "存储大小": "64",
+            "创建时间": time.strftime("%Y-%m-%d %H:%M:%S"), "最后命中": "-"})
+        if ce is None:
+            raise HTTPException(status_code=400, detail=f"创建缓存条目失败: {missing}")
+        return ce
+
+    target_a = _cache("A", f"federated query on {source_no} join dims")
+    target_b = _cache("B", f"aggregate scan of {source_no} daily")
+    control_c = _cache("C", f"federated query on {source_no}-CTRL join dims")
+    near_d = _cache("D", f"federated query on {source_no}9 join dims")
+
+    # 先下线（暂不归档，模拟单边变更中断）→ 同一轮恢复确认 → 冲突
+    opened = result_cache_svc.retire_source(sid, finalize=False)
+    conflict = result_cache_svc.recover_source(sid)
+    finalized = result_cache_svc.finalize_retire_batch(opened["batch_id"])
+
+    # 退役完成后有效读取不成立
+    read_after_retire = result_cache_svc.get_cached_result(target_a["查询摘要"])
+
+    # 契约签署并凭证据批次校验 → 违约回写
+    contract, missing = contract_svc.create_entry({
+        "契约编号": f"DATA-R{sid:04d}", "数据集": f"dataset_{source_no}",
+        "Schema约束": "id,name", "SLA定义": "每小时更新", "更新频率": "3600",
+        "负责人": "pipeline", "消费者": "dashboard", "生效时间": time.strftime("%Y-%m-%d")})
+    if contract is None:
+        raise HTTPException(status_code=400, detail=f"创建契约失败: {missing}")
+    contract_svc.run_action(contract["id"], "签署契约")
+    verdict_retire = contract_svc.verify_with_retire_evidence(contract["id"])
+
+    # 正式恢复 → 再次校验 → 恢复回写
+    recovered = result_cache_svc.recover_source(sid)
+    verdict_recover = contract_svc.verify_with_retire_evidence(contract["id"])
+    read_after_recover = result_cache_svc.get_cached_result(target_a["查询摘要"])
+
+    return {"ok": True, "pipeline": "retire_recover_evidence",
+            "source": {"id": sid, "no": source_no},
+            "caches": {"target": [target_a["id"], target_b["id"]],
+                       "control": control_c["id"], "near": near_d["id"]},
+            "opened": opened, "conflict": conflict, "finalized": finalized,
+            "read_after_retire": read_after_retire,
+            "contract_id": contract["id"],
+            "verdict_retire": verdict_retire, "recovered": recovered,
+            "verdict_recover": verdict_recover,
+            "read_after_recover": read_after_recover is not None,
+            "control_status": store.find("source_registry", control["id"]).get("status"),
+            "control_cache_status": store.find("result_cache", control_c["id"]).get("status"),
+            "near_cache_status": store.find("result_cache", near_d["id"]).get("status"),
+            "invariant": result_cache_svc.verify_retirement_invariant()}
